@@ -1,0 +1,19 @@
+# Entornos virtuales (pesan mucho y se recrean con requirements.txt)
+.venv/
+.venv-juego/
+venv/
+env/
+
+# Archivos temporales de Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Datos descargados (MNIST se vuelve a bajar solo)
+*.npz
+
+# Archivos del editor y del sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

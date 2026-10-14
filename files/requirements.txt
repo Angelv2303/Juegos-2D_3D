@@ -1,0 +1,5 @@
+pygame-ce
+ursina
+numpy
+matplotlib
+tensorflow
