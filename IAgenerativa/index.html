@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f4f0">
+  <title>Etiqueta — IA generativa</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <aside class="rail">
+    <a class="brand" href="#" aria-label="Etiqueta, inicio"><span class="brand-mark">e<span>.</span></span></a>
+    <button class="rail-button" id="new-chat" aria-label="Nueva conversación" title="Nueva conversación">＋</button>
+    <div class="rail-spacer"></div>
+    <span class="rail-status" id="api-dot" title="Estado de conexión"></span>
+    <span class="rail-version">LOCAL&nbsp; · &nbsp;01</span>
+  </aside>
+
+  <main class="workspace">
+    <header class="topbar">
+      <div class="topbar-label"><span class="eyebrow">ESPACIO PERSONAL</span><span class="breadcrumb">/ &nbsp;IA GENERATIVA</span></div>
+      <button class="memory-toggle" id="memory-toggle"><span class="memory-icon">✳</span> Memoria <span class="memory-count" id="memory-count">0</span></button>
+    </header>
+
+    <section class="layout">
+      <aside class="setup-panel">
+        <div class="panel-intro"><span class="eyebrow">CONFIGURA TU EXPERIENCIA</span><span class="step">01 — 03</span></div>
+        <h1>Una idea,<br>un <em>universo.</em></h1>
+        <p class="intro-copy">Define el mundo donde quieres que viva tu IA. Cada respuesta comienza por aquí.</p>
+
+        <form id="scope-form">
+          <label class="field-label" for="label-input">ETIQUETA <span class="required">*</span></label>
+          <div class="input-wrap tag-wrap"><span class="hash">#</span><input id="label-input" maxlength="120" placeholder="p. ej. Jardines urbanos" required value=""></div>
+          <p class="field-hint">El tema que marcará el límite de esta conversación.</p>
+
+          <label class="field-label description-label" for="description-input">DIRECCIÓN <span class="optional">OPCIONAL</span></label>
+          <textarea id="description-input" rows="3" maxlength="1500" placeholder="¿Qué quieres explorar? ¿A quién va dirigida la conversación?"></textarea>
+
+          <div class="scope-preview"><span class="scope-glyph">◈</span><div><b>Ámbito activo</b><span id="scope-preview-text">Tu etiqueta guiará cada respuesta.</span></div><span class="scope-indicator"></span></div>
+
+          <div class="panel-divider"></div>
+          <div class="field-label output-label">FORMATO DE RESPUESTA</div>
+          <label class="output-option"><span class="option-icon">▤</span><span><b>Texto</b><small>Siempre incluido</small></span><span class="always-on">SIEMPRE</span></label>
+          <label class="output-option selectable"><input id="audio-toggle" type="checkbox"><span class="option-icon audio-icon">◖</span><span><b>Voz</b><small>Locución del navegador, sin costo</small></span><span class="check-ui"></span></label>
+          <label class="output-option selectable"><input id="image-toggle" type="checkbox"><span class="option-icon image-icon">▧</span><span><b>Imagen</b><small id="image-status">Generación local con ComfyUI</small></span><span class="check-ui"></span></label>
+          <button class="save-scope" type="button" id="save-scope">Guardar configuración <span>↗</span></button>
+        </form>
+
+        <div class="sidebar-footer"><span class="privacy-dot"></span> Tu espacio se guarda en este navegador.</div>
+      </aside>
+
+      <section class="chat-panel" aria-label="Conversación">
+        <div class="chat-top"><div><span class="eyebrow">CONVERSACIÓN</span><span class="chat-mode" id="chat-mode">ESPERANDO TU ETIQUETA</span></div><button class="icon-button" id="clear-chat" aria-label="Limpiar conversación" title="Limpiar conversación">⌫</button></div>
+        <div class="messages" id="messages" aria-live="polite">
+          <div class="welcome" id="welcome">
+            <div class="welcome-orbit"><span class="orbit-dot"></span><span class="orbit-center">e<span>.</span></span></div>
+            <span class="eyebrow">TU ESPACIO CREATIVO</span>
+            <h2>¿Qué te gustaría<br><em>imaginar hoy?</em></h2>
+            <p>Escribe una pregunta o un encargo creativo. Tu etiqueta mantiene cada idea dentro del mundo que elegiste.</p>
+            <div class="suggestions"><button class="suggestion" data-prompt="Ayúdame a empezar con tres ideas interesantes.">✳ &nbsp;Dame una idea para empezar</button><button class="suggestion" data-prompt="Crea una pequeña guía práctica para principiantes.">↗ &nbsp;Crea una guía breve</button></div>
+          </div>
+        </div>
+        <div class="composer-area">
+          <div class="composer-meta"><span><span class="lock-icon">◈</span> DELIMITADA POR <b id="composer-label">ETIQUETA PENDIENTE</b></span><span id="char-count">0 / 6000</span></div>
+          <form class="composer" id="chat-form"><textarea id="message-input" rows="1" maxlength="6000" placeholder="Escribe tu pregunta o encargo…" aria-label="Tu mensaje" required></textarea><button class="send-button" type="submit" id="send-button" aria-label="Enviar mensaje"><span>↑</span></button></form>
+          <div class="composer-foot"><span>Las notas de memoria se pueden revisar y borrar.</span><span>HECHO PARA EXPLORAR &nbsp;✳</span></div>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status"></div>
+  <dialog id="memory-dialog" class="memory-dialog"><form method="dialog"><div class="dialog-top"><div><span class="eyebrow">MEMORIA LOCAL</span><h2>Contexto que permanece.</h2></div><button class="icon-button" aria-label="Cerrar">×</button></div><p>Estas notas solo se guardan en este navegador y pueden ayudar a personalizar respuestas futuras dentro de tu etiqueta.</p><label class="field-label" for="memory-input">TUS NOTAS</label><textarea id="memory-input" rows="7" maxlength="3000" placeholder="Preferencias, contexto o detalles que quieras recordar…"></textarea><div class="dialog-actions"><button type="button" class="text-button" id="forget-memory">Borrar notas</button><button type="button" class="save-scope" id="save-memory">Guardar notas <span>↗</span></button></div></form></dialog>
+  <script src="app.js"></script>
+</body>
+</html>
