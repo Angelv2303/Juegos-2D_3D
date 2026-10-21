@@ -8,12 +8,14 @@ Novedades de esta version:
   - Suelo y techo permanentes: el jugador ya no se hunde al cambiar el mapa.
   - Zona fija alrededor del jugador: su habitacion se conserva y cambia lo de alrededor.
   - Apagon de camara durante el cambio, sin cuenta atras.
+  - Umbrales que llevan a zonas nuevas, con materiales e iluminacion diferentes.
   - Shader estilo camara analogica (grano, aberracion, viñeta, scanlines).
   - Sistema de CORDURA con alucinaciones (siluetas, pasos fantasma, reloj, flechas que mienten...).
 """
 import math
 import random
 from pathlib import Path
+from time import perf_counter
 
 from panda3d.core import PNMImage, Texture as PandaTexture
 from ursina import *
@@ -24,7 +26,7 @@ from ursina.prefabs.first_person_controller import FirstPersonController
 # AJUSTES (aqui puedes tocar el juego sin buscar por todo el codigo)
 # ----------------------------------------------------------------------------
 CELDA = 5.5
-LADO = 21                         # cuadricula grande de salas y corredores
+LADO = 31                         # cada zona es amplia; los umbrales llevan a nuevas zonas
 ALTO_MURO = 4.2
 GROSOR_MURO = 0.18                # pared visible fina; la colision sigue cubriendo la celda
 COLOR_PAPEL = (180, 157, 91)
@@ -111,6 +113,21 @@ def crear_textura(nombre, tipo, lado=256):
                 base = (0.44 + grano + fibra - mancha + hilo,
                         0.41 + grano + fibra - mancha * 0.83 + hilo,
                         0.28 + grano * 0.7 + fibra - mancha * 0.63 + hilo)
+            elif tipo == "concreto":
+                # Hormigón de servicio: juntas, filtraciones y zonas reparadas.
+                junta = -0.095 if x % 64 < 2 or y % 96 < 2 else 0
+                humedad = max(0, nubes - 0.46) * 0.23
+                parche = -0.055 if valor_ruido(x, y, 48) < 0.34 else 0
+                base = (0.43 + grano + junta + parche - humedad,
+                        0.44 + grano + junta + parche - humedad,
+                        0.37 + grano * 0.8 + junta + parche - humedad * 0.8)
+            elif tipo == "loseta":
+                # Baldosas viejas de un corredor institucional, con juntas oscuras.
+                junta = -0.17 if x % 64 < 2 or y % 64 < 2 else 0
+                mancha = max(0, nubes - 0.58) * 0.17
+                base = (0.52 + grano + junta - mancha,
+                        0.53 + grano + junta - mancha,
+                        0.46 + grano * 0.8 + junta - mancha * 0.8)
             else:
                 # Placas de techo con halos amarillos y suciedad alrededor de las juntas.
                 junta = -0.15 if x % 64 < 2 or y % 64 < 2 else 0
@@ -133,6 +150,8 @@ def crear_textura(nombre, tipo, lado=256):
 TEXTURA_PAPEL = crear_textura("papel_backrooms", "papel")
 TEXTURA_ALFOMBRA = crear_textura("alfombra_backrooms", "alfombra")
 TEXTURA_TECHO = crear_textura("losetas_techo_backrooms", "techo")
+TEXTURA_CONCRETO = crear_textura("hormigon_servicio", "concreto")
+TEXTURA_LOSETAS = crear_textura("losetas_institucionales", "loseta")
 DIRECTORIO = Path(__file__).resolve().parent
 
 
@@ -144,7 +163,8 @@ class Estado:
     cordura = 100.0
     techo = 100.0                 # maximo de cordura recuperable (baja con cada cambio)
     cambios = 0
-    fase = "juego"                # "juego" o "fin"
+    nivel_actual = 0
+    fase = "menu"                 # "menu", "opciones", "juego" o "fin"
     fin_t = 0.0
     glitch = 0.0                  # intensidad de distorsion de la camara
     fundido = 0.0                 # apagon posterior al cambio
@@ -161,11 +181,14 @@ class Estado:
     t_silueta = 25.0
     t_reloj = 25.0
     t_mensaje = 30.0
+    t_evento_mental = 0.0       # separa las alucinaciones fuertes
+    t_glitch = 0.0              # evita lanzar distorsion cada frame
     desfase_reloj = 0.0
     ecos = []                     # pasos fantasma pendientes (segundos hasta sonar)
     mov_antes = False
     ultimo_seg = -1
     ultima_cordura = -1
+    ultima_fase_cordura = None
     alpha_velo = -1
     energia_sprint = ENERGIA_SPRINT_MAX
     ultima_energia_sprint = -1
@@ -174,6 +197,7 @@ class Estado:
     agua_inventario = 0
     refresco_inventario = 0
     refresco_t = 0.0
+    volumen = 0.65
     zoom_ui_t = 0.0
     fallo_linterna = 0.0
     ruido_t = 0.0
@@ -189,6 +213,13 @@ E = Estado()
 # ----------------------------------------------------------------------------
 # VENTANA, AUDIO Y AMBIENTE
 # ----------------------------------------------------------------------------
+# Algunas instalaciones de Ursina no incluyen OpenSans-Regular.ttf. En Windows
+# usamos Arial como respaldo para conservar la legibilidad de menús y avisos.
+if not (application.fonts_folder / Text.default_font).is_file():
+    fuente_respaldo = Path("C:/Windows/Fonts/arial.ttf")
+    if fuente_respaldo.is_file():
+        application.fonts_folder = fuente_respaldo.parent
+        Text.default_font = fuente_respaldo.name
 app = Ursina(title="BACKROOM | El laberinto cambiante")
 window.color = color.rgb32(10, 11, 9)
 window.fps_counter.enabled = MOSTRAR_FPS
@@ -237,6 +268,42 @@ scene.fog_color = color.rgb32(8, 7, 4)
 scene.fog_density = (6, 46)
 ambiente = AmbientLight(color=color.rgb32(20, 18, 12))
 
+# Los niveles comparten geometría procedural, pero cambian materiales, luz y niebla.
+# Al superar la última zona, el ciclo vuelve a empezar con más desgaste visual.
+PERFILES_ZONA = (
+    {
+        "nombre": "NIVEL 0  /  EL LOBBY",
+        "pared": TEXTURA_PAPEL, "suelo": TEXTURA_ALFOMBRA, "techo": TEXTURA_TECHO,
+        "tinte_pared": (255, 255, 255), "tinte_suelo": (255, 255, 255),
+        "tinte_techo": (255, 255, 255), "zocalo": (79, 76, 54), "remate": (126, 118, 77),
+        "luz": (236, 238, 187), "ambiente": (20, 18, 12), "niebla": (8, 7, 4),
+        "escala_pared": (2, 1.5),
+    },
+    {
+        "nombre": "NIVEL 1  /  PASILLOS DE SERVICIO",
+        "pared": TEXTURA_CONCRETO, "suelo": TEXTURA_ALFOMBRA, "techo": TEXTURA_TECHO,
+        "tinte_pared": (207, 215, 198), "tinte_suelo": (182, 191, 174),
+        "tinte_techo": (177, 183, 163), "zocalo": (63, 70, 61), "remate": (93, 105, 86),
+        "luz": (180, 205, 188), "ambiente": (14, 18, 15), "niebla": (7, 11, 9),
+        "escala_pared": (2, 1.5),
+    },
+    {
+        "nombre": "NIVEL 2  /  MÓDULOS INTERIORES",
+        "pared": TEXTURA_PAPEL, "suelo": TEXTURA_LOSETAS, "techo": TEXTURA_CONCRETO,
+        "tinte_pared": (210, 204, 161), "tinte_suelo": (187, 188, 163),
+        "tinte_techo": (162, 166, 149), "zocalo": (64, 62, 49), "remate": (106, 96, 68),
+        "luz": (214, 194, 143), "ambiente": (17, 16, 12), "niebla": (9, 8, 5),
+        "escala_pared": (2, 1.5),
+    },
+)
+
+
+def perfil_de_zona(indice):
+    """Devuelve uno de los ambientes y oscurece el ciclo con cada vuelta."""
+    perfil = PERFILES_ZONA[indice % len(PERFILES_ZONA)].copy()
+    perfil["ciclo"] = indice // len(PERFILES_ZONA)
+    return perfil
+
 
 # ----------------------------------------------------------------------------
 # OBJETOS DEL MUNDO
@@ -250,6 +317,7 @@ class Mancha(Entity):
 class Fixture(Entity):
     """Tubo fluorescente viejo: vibra y pierde intensidad sin apagarse del todo."""
     def __init__(self, semilla=0, **kwargs):
+        self.tono_base = kwargs.pop("tono", (236, 238, 187))
         super().__init__(**kwargs)
         self.semilla = semilla * 9.0
         self.t = semilla * 3.0
@@ -260,15 +328,16 @@ class Fixture(Entity):
         self.luz = None
         if USAR_LUCES_PUNTUALES:
             self.luz = PointLight(parent=self, position=(0, -0.24, 0),
-                                  color=color.rgb32(236, 238, 187))
+                                  color=color.rgb32(*self.tono_base))
             self.luz._light.setAttenuation(Vec3(1, 0, 0.028))
         Entity(parent=self, model="cube", position=(0, -0.10, 0), scale=(2.3, 0.08, 0.72),
                color=color.rgb32(62, 54, 39), unlit=True)
         self.tubo = Entity(parent=self, model="cube", position=(0, -0.16, 0), scale=(1.95, 0.04, 0.45),
-                           color=color.rgb32(238, 236, 193), unlit=True)
+                           color=color.rgb32(*self.tono_base), unlit=True)
         self.tubo_halo = Entity(parent=self, model="cube", position=(0, -0.19, 0),
                                 scale=(2.08, 0.018, 0.53),
-                                color=color.rgba32(198, 190, 120, 55), unlit=True)
+                                color=color.rgba32(*(int(c * 0.78) for c in self.tono_base), 55),
+                                unlit=True)
 
     def update(self):
         dt = time.dt
@@ -288,24 +357,44 @@ class Fixture(Entity):
         temblor = 0.035 * math.sin(self.t * 43 + self.semilla) + 0.018 * math.sin(self.t * 91)
         self.intensidad += (self.intensidad_objetivo - self.intensidad) * min(1, dt * 13)
         brillo = max(0.16, min(1.0, self.intensidad + temblor))
-        self.tubo.color = color.rgb32(int(100 + 138 * brillo), int(102 + 136 * brillo), int(80 + 120 * brillo))
-        self.tubo_halo.color = color.rgba32(198, 190, 120, int(25 + 52 * brillo))
+        factor_luz = 0.42 + 0.58 * brillo
+        self.tubo.color = color.rgb32(*(int(c * factor_luz) for c in self.tono_base))
+        self.tubo_halo.color = color.rgba32(
+            *(int(c * 0.78) for c in self.tono_base), int(25 + 52 * brillo))
         if self.luz:
-            self.luz.color = color.rgb32(int(236 * brillo), int(238 * brillo), int(187 * brillo))
+            self.luz.color = color.rgb32(*(int(c * brillo) for c in self.tono_base))
 
 
 # ----------------------------------------------------------------------------
 # LABERINTO
 # ----------------------------------------------------------------------------
 class Laberinto:
-    """Laberinto procedural; las flechas marcan el camino corto hasta la salida."""
+    """Zona procedural; las flechas conducen a un umbral que lleva más adentro."""
     def __init__(self):
         self.raiz = None
         self.base = None
+        self.suelo = None
+        self.techo = None
         self.grupo_muros = None
+        self.nivel = 0
+        self.perfil = perfil_de_zona(0)
         self.mapa = []
         self.camino = []
         self.fixtures = []
+        self.celdas_colision_pared = 0
+        self.colliders_pared = 0
+        self.reconstruccion_en_curso = False
+        self._iter_reconstruccion = None
+        self._raiz_anterior = None
+        self._rng_reconstruccion = None
+        self._grupos_combinacion = []
+        self._indice_grupo_combinacion = 0
+        self._estado_combinacion = None
+        self._jugador_reconstruccion = None
+        self._gravedad_previa = 1
+        self._salto_previo = 0.65
+        self._transicion_nivel = False
+        self.nivel_acaba_de_cambiar = False
         self.semilla = random.randrange(1_000_000)
         self.reloj = 0.0
         self.intervalo = INTERVALO_MAX
@@ -467,14 +556,34 @@ class Laberinto:
         """Suelo y techo permanentes: nunca se destruyen, asi el jugador no se hunde."""
         ancho = LADO * CELDA
         self.base = Entity(name="base_laberinto")
-        Entity(parent=self.base, model="cube", name="moqueta", position=(0, -0.18, 0),
-               scale=(ancho, 0.36, ancho), texture=TEXTURA_ALFOMBRA,
-               texture_scale=(LADO * 2.8, LADO * 2.8), color=color.white, collider="box")
-        Entity(parent=self.base, model="cube", name="techo", position=(0, ALTO_MURO + 0.18, 0),
-               scale=(ancho, 0.36, ancho), texture=TEXTURA_TECHO, texture_scale=(LADO, LADO),
-               color=color.white)
+        self.suelo = Entity(parent=self.base, model="cube", name="moqueta", position=(0, -0.18, 0),
+                            scale=(ancho, 0.36, ancho), texture=self.perfil["suelo"],
+                            texture_scale=(LADO * 2.8, LADO * 2.8), color=color.white,
+                            collider="box")
+        self.techo = Entity(parent=self.base, model="cube", name="techo",
+                            position=(0, ALTO_MURO + 0.18, 0), scale=(ancho, 0.36, ancho),
+                            texture=self.perfil["techo"], texture_scale=(LADO, LADO),
+                            color=color.white)
 
-    def reconstruir(self, jugador):
+    def aplicar_perfil(self):
+        """Cambia el aspecto global al cruzar a una nueva zona."""
+        ciclo = self.perfil.get("ciclo", 0)
+        oscurecer = max(0.60, 1.0 - ciclo * 0.09)
+
+        def tono(clave):
+            return color.rgb32(*(max(0, min(255, int(c * oscurecer)))
+                                 for c in self.perfil[clave]))
+
+        self.suelo.texture = self.perfil["suelo"]
+        self.suelo.color = tono("tinte_suelo")
+        self.techo.texture = self.perfil["techo"]
+        self.techo.color = tono("tinte_techo")
+        ambiente.color = tono("ambiente")
+        scene.fog_color = tono("niebla")
+        self.grupo_muros.color = tono("tinte_pared")
+
+    def _preparar_reconstruccion(self, jugador, conservar_anterior):
+        self.perfil = perfil_de_zona(self.nivel)
         fijas, origen = None, (1, 1)
         if jugador is not None:
             gx, gz = self.celda_de(jugador.x, jugador.z)
@@ -486,13 +595,14 @@ class Laberinto:
                      for z in range(max(1, gz - RADIO_FIJO), min(LADO - 1, gz + RADIO_FIJO + 1))
                      for x in range(max(1, gx - RADIO_FIJO), min(LADO - 1, gx + RADIO_FIJO + 1))}
 
-        if self.raiz:
+        raiz_anterior = self.raiz if conservar_anterior else None
+        if self.raiz and not conservar_anterior:
             destroy(self.raiz)
         self.fixtures = []
         self.puerta_imitada = None
         self.puerta_imitada_revelada = False
         self.tiempo_mirando_puerta = 0.0
-        self.raiz = Entity(name="laberinto")
+        self.raiz = Entity(name="laberinto", enabled=not conservar_anterior)
         self.grupo_muros = Entity(parent=self.raiz)
         self.grupo_zocalos = Entity(parent=self.raiz)
         self.grupo_remates = Entity(parent=self.raiz)
@@ -500,33 +610,224 @@ class Laberinto:
         self.mapa, rng = self.generar_mapa(fijas, origen)
         self.celda_jugador = origen
         self.camino = self.camino_corto(origen, (LADO - 2, LADO - 2))
-        self.dibujar_mundo(rng, origen if fijas else None)
+        return rng, origen if fijas else None, raiz_anterior
+
+    def _finalizar_reconstruccion(self, rng, raiz_anterior=None):
         self.dibujar_flechas(rng)
         self.dibujar_salida()
         self.dibujar_salida_imitada(rng)
+        self.nivel_acaba_de_cambiar = self._transicion_nivel
+        self.aplicar_perfil()
+        if self._transicion_nivel:
+            jugador = self._jugador_reconstruccion
+            x, z = self.a_mundo(1, 1)
+            jugador.position = (x, 0.2, z)
+            jugador.rotation_y = rumbo_inicial
+            jugador.camera_pivot.y = 1.65
+            jugador.camera_pivot.rotation = Vec3.zero
+            jugador.grounded = False
+            self.nivel_acaba_de_cambiar = True
         self.reloj = 0.0
         factor = 0.58 + 0.42 * (E.cordura / 100.0)    # con menos cordura cambia mas seguido
         self.intervalo = random.uniform(INTERVALO_MIN, INTERVALO_MAX) * factor
         self.tiempo_aviso = self.intervalo
+        if raiz_anterior:
+            raiz_anterior.enabled = False
+        self.raiz.enabled = True
+        if raiz_anterior:
+            destroy(raiz_anterior)
+        self._raiz_anterior = None
+        self._iter_reconstruccion = None
+        self.reconstruccion_en_curso = False
+        if self._jugador_reconstruccion:
+            self._jugador_reconstruccion.gravity = self._gravedad_previa
+            self._jugador_reconstruccion.jump_height = self._salto_previo
+        self._jugador_reconstruccion = None
+        self._transicion_nivel = False
 
-    def dibujar_mundo(self, rng, zona_fija):
+    def reconstruir(self, jugador):
+        """Reconstrucción inmediata usada al arrancar y reiniciar la partida."""
+        rng, zona_fija, _ = self._preparar_reconstruccion(jugador, False)
+        for _ in self.dibujar_mundo_en_pasos(rng, zona_fija):
+            pass
+        self._combinar_mundo()
+        self._finalizar_reconstruccion(rng)
+
+    def iniciar_reconstruccion(self, jugador):
+        """Prepara otro mapa mientras conserva el anterior hasta completar el nuevo."""
+        if self.reconstruccion_en_curso:
+            return
+        self.nivel_acaba_de_cambiar = False
+        rng, zona_fija, self._raiz_anterior = self._preparar_reconstruccion(jugador, True)
+        self._rng_reconstruccion = rng
+        self._iter_reconstruccion = self.dibujar_mundo_en_pasos(rng, zona_fija)
+        self.reconstruccion_en_curso = True
+        self._jugador_reconstruccion = jugador
+        self._gravedad_previa = jugador.gravity
+        self._salto_previo = jugador.jump_height
+        jugador.speed = 0
+        jugador.gravity = 0
+        jugador.jump_height = 0
+
+    def iniciar_nueva_zona(self, jugador, nivel):
+        """Construye una zona nueva mientras una transición oscura oculta el cambio."""
+        if self.reconstruccion_en_curso:
+            return False
+        self.nivel = nivel
+        self._transicion_nivel = True
+        rng, zona_fija, self._raiz_anterior = self._preparar_reconstruccion(None, True)
+        self._rng_reconstruccion = rng
+        self._iter_reconstruccion = self.dibujar_mundo_en_pasos(rng, zona_fija)
+        self.reconstruccion_en_curso = True
+        self._jugador_reconstruccion = jugador
+        self._gravedad_previa = jugador.gravity
+        self._salto_previo = jugador.jump_height
+        jugador.speed = 0
+        jugador.gravity = 0
+        jugador.jump_height = 0
+        return True
+
+    def avanzar_reconstruccion(self):
+        """Construye filas y combina vértices por lotes; True cuando está listo."""
+        if not self.reconstruccion_en_curso:
+            return False
+
+        if self._iter_reconstruccion is not None:
+            try:
+                next(self._iter_reconstruccion)
+                return False
+            except StopIteration:
+                self._iter_reconstruccion = None
+                self._preparar_combinacion_progresiva()
+
+        if self._avanzar_combinacion_progresiva():
+            self._finalizar_reconstruccion(self._rng_reconstruccion,
+                                           self._raiz_anterior)
+            self._rng_reconstruccion = None
+            self._grupos_combinacion = []
+            self._estado_combinacion = None
+            return True
+        return False
+
+    def _combinar_mundo(self):
+        self.grupo_muros.combine()
+        self.grupo_muros.texture = self.perfil["pared"]
+        self.grupo_muros.texture_scale = self.perfil["escala_pared"]
+        self.grupo_zocalos.combine()
+        self.grupo_remates.combine()
+
+    def _preparar_combinacion_progresiva(self):
+        self._grupos_combinacion = [
+            (self.grupo_muros, self.perfil["pared"], self.perfil["escala_pared"]),
+            (self.grupo_zocalos, None, None),
+            (self.grupo_remates, None, None),
+        ]
+        self._indice_grupo_combinacion = 0
+        self._estado_combinacion = None
+
+    def _iniciar_grupo_combinacion(self):
+        while self._indice_grupo_combinacion < len(self._grupos_combinacion):
+            grupo, textura, escala_textura = self._grupos_combinacion[
+                self._indice_grupo_combinacion]
+            elementos = [entidad for entidad in grupo.children if entidad.model is not None]
+            if elementos:
+                self._estado_combinacion = {
+                    "grupo": grupo,
+                    "textura": textura,
+                    "escala_textura": escala_textura,
+                    "elementos": elementos,
+                    "indice": 0,
+                    "offset": 0,
+                    "vertices": [],
+                    "triangulos": [],
+                    "uvs": [],
+                    "colores": [],
+                }
+                return True
+            self._indice_grupo_combinacion += 1
+        return False
+
+    def _avanzar_combinacion_progresiva(self):
+        limite = perf_counter() + 0.006
+        while perf_counter() < limite:
+            if self._estado_combinacion is None and not self._iniciar_grupo_combinacion():
+                return True
+
+            estado = self._estado_combinacion
+            if estado["indice"] >= len(estado["elementos"]):
+                grupo = estado["grupo"]
+                grupo.model = Mesh(vertices=estado["vertices"],
+                                   triangles=estado["triangulos"],
+                                   uvs=estado["uvs"], colors=estado["colores"],
+                                   mode="triangle")
+                if estado["textura"]:
+                    grupo.texture = estado["textura"]
+                    grupo.texture_scale = estado["escala_textura"]
+                for entidad in estado["elementos"]:
+                    destroy(entidad)
+                self._estado_combinacion = None
+                self._indice_grupo_combinacion += 1
+                continue
+
+            entidad = estado["elementos"][estado["indice"]]
+            modelo = entidad.model
+            if not hasattr(modelo, "vertices") or not modelo.vertices:
+                modelo = load_model(modelo.name, use_deepcopy=True)
+                entidad.model = modelo
+                entidad.origin = entidad.origin
+
+            transformacion = modelo.getTransform(estado["grupo"]).getMat()
+            vertices = modelo.vertices
+            estado["vertices"].extend(
+                Vec3(*transformacion.xformPoint(Vec3(*vertice))) for vertice in vertices)
+            triangulos = modelo.triangles or list(range(len(vertices)))
+            indices = []
+            for triangulo in triangulos:
+                if isinstance(triangulo, int):
+                    indices.append(triangulo)
+                elif len(triangulo) == 3:
+                    indices.extend(triangulo)
+                elif len(triangulo) == 4:
+                    indices.extend((triangulo[0], triangulo[1], triangulo[2],
+                                    triangulo[2], triangulo[3], triangulo[0]))
+            indices = [indice + estado["offset"] for indice in indices]
+            estado["triangulos"].extend(
+                (indices[i], indices[i + 1], indices[i + 2])
+                for i in range(0, len(indices) - 1, 3))
+            estado["offset"] += len(vertices)
+
+            if modelo.uvs:
+                estado["uvs"].extend(
+                    (uv * entidad.texture_scale) + entidad.texture_offset
+                    for uv in modelo.uvs)
+            else:
+                estado["uvs"].extend((0, 0) for _ in vertices)
+            if modelo.colors:
+                estado["colores"].extend(
+                    Color(*color_vertice) * entidad.color for color_vertice in modelo.colors)
+            else:
+                estado["colores"].extend((entidad.color,) * len(vertices))
+            estado["indice"] += 1
+        return False
+
+    def dibujar_mundo_en_pasos(self, rng, zona_fija):
         abiertas = []
+        self.celdas_colision_pared = 0
+        self.colliders_pared = 0
         alto_zocalo = 0.30
         grueso_zocalo = 0.085
-        colores_zocalo = color.rgb32(79, 76, 54)
-        color_remate = color.rgb32(126, 118, 77)
+        colores_zocalo = color.rgb32(*self.perfil["zocalo"])
+        color_remate = color.rgb32(*self.perfil["remate"])
         for gz in range(LADO):
+            fila_colision = []
             for gx in range(LADO):
                 wx, wz = self.a_mundo(gx, gz)
                 if self.mapa[gz][gx]:
                     if not self.toca_hueco(gx, gz):
                         continue          # pared interior: no se dibuja ni colisiona
-                    pos = (wx, ALTO_MURO / 2, wz)
-                    esc = (CELDA, ALTO_MURO, CELDA)
-                    # La geometria visible son paneles finos sobre las caras expuestas.
-                    # La colision conserva el volumen de la celda para que no se atraviese.
-                    Entity(parent=self.raiz, name="colision_pared", position=pos, scale=esc,
-                           collider="box")
+                    # Guardamos las celdas sólidas para agrupar colisiones contiguas
+                    # al final. La unión de cajas conserva exactamente sus límites.
+                    fila_colision.append(gx)
                     # Pared y zocalo solo en las caras que dan a un espacio transitable.
                     for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                         nx, nz = gx + dx, gz + dz
@@ -567,13 +868,25 @@ class Laberinto:
                                scale=(rng.uniform(0.22, 0.65), 0.012, rng.uniform(0.25, 0.8)),
                                color=color.rgb32(rng.randint(61, 74), rng.randint(57, 69), rng.randint(37, 49)))
 
-        # TODAS las paredes en UNA sola malla: de ~1000 llamadas de dibujo a 1.
-        self.grupo_muros.combine()
-        self.grupo_muros.texture = TEXTURA_PAPEL
-        self.grupo_muros.texture_scale = (2, 1.5)
-        # Se combinan por separado para conservar el rendimiento del escenario.
-        self.grupo_zocalos.combine()
-        self.grupo_remates.combine()
+            # Una caja por tramo horizontal conserva la unión de las celdas.
+            self.celdas_colision_pared += len(fila_colision)
+            if fila_colision:
+                inicio = anterior = fila_colision[0]
+                for gx in fila_colision[1:] + [None]:
+                    if gx is not None and gx == anterior + 1:
+                        anterior = gx
+                        continue
+                    centro_x, centro_z = self.a_mundo((inicio + anterior) / 2, gz)
+                    Entity(parent=self.raiz, name="colision_pared",
+                           position=(centro_x, ALTO_MURO / 2, centro_z),
+                           scale=((anterior - inicio + 1) * CELDA, ALTO_MURO, CELDA),
+                           collider="box")
+                    self.colliders_pared += 1
+                    if gx is not None:
+                        inicio = anterior = gx
+
+            if gz < LADO - 1:
+                yield gz
 
         # Columnas: nunca dentro ni pegadas a la zona fija (el jugador podria quedar atrapado).
         ruta = set(self.camino)
@@ -593,8 +906,8 @@ class Laberinto:
             wx, wz = self.a_mundo(gx, gz)
             Entity(parent=self.raiz, model="cube", name="columna",
                    position=(wx, ALTO_MURO / 2, wz), scale=(0.82, ALTO_MURO, 0.82),
-                   texture=TEXTURA_PAPEL, texture_scale=(1, 1.5),
-                   color=color.white, collider="box")
+                   texture=self.perfil["pared"], texture_scale=(1, 1.5),
+                   color=color.rgb32(*self.perfil["tinte_pared"]), collider="box")
 
         # La mayoria de los focos acompañan los pasillos principales; unos pocos
         # aparecen en salas laterales para crear zonas aisladas de luz.
@@ -609,7 +922,8 @@ class Laberinto:
         rng.shuffle(lugares_luz)
         for paneles, (gx, gz) in enumerate(lugares_luz[:12]):
             wx, wz = self.a_mundo(gx, gz)
-            f = Fixture(parent=self.raiz, position=(wx, ALTO_MURO - 0.12, wz), semilla=rng.random())
+            f = Fixture(parent=self.raiz, position=(wx, ALTO_MURO - 0.12, wz),
+                        semilla=rng.random(), tono=self.perfil["luz"])
             self.fixtures.append(f)
             # Algunos cables cruzan el plafon y cuelgan un poco sobre el pasillo.
             if paneles % 4 == 1:
@@ -729,6 +1043,7 @@ class Laberinto:
             position=(wx + normal_x * (CELDA / 2 + 0.055), 0,
                       wz + normal_z * (CELDA / 2 + 0.055)),
             rotation_y=yaw)
+        self.puerta_imitada.es_alucinacion = True
         self.puerta_imitada.enabled = True
         self.puerta_imitada_revelada = False
         self.tiempo_mirando_puerta = 0.0
@@ -768,12 +1083,13 @@ class Laberinto:
         return False
 
     def actualizar(self, dt, jugador):
-        """Cuenta atras INTERNA (el jugador no la ve). True cuando el mapa cambia."""
+        """Cuenta atrás interna; inicia la reconstrucción al vencer el temporizador."""
+        if self.reconstruccion_en_curso:
+            return False
         self.reloj += dt
         self.tiempo_aviso = max(0.0, self.intervalo - self.reloj)
         if self.reloj >= self.intervalo:
-            self.reconstruir(jugador)
-            return True
+            self.iniciar_reconstruccion(jugador)
         return False
 
 
@@ -784,6 +1100,7 @@ class Silueta(Entity):
     """Figura oscura en el borde de la vision. Desaparece si la miras; si no, se acerca."""
     def __init__(self):
         super().__init__(enabled=False)
+        self.es_alucinacion = True
         negro = color.rgb32(3, 3, 3)
         Entity(parent=self, model="cube", position=(0, 0.40, 0), scale=(0.34, 0.80, 0.22), color=negro, unlit=True)
         Entity(parent=self, model="cube", position=(0, 1.20, 0), scale=(0.52, 0.80, 0.26), color=negro, unlit=True)
@@ -914,11 +1231,12 @@ class Consumible(Entity):
 class EntidadCiega(Entity):
     """Silueta sobrenatural que escucha, investiga y solo persigue con certeza suficiente.
 
-    Estados: acecho -> investigacion -> busqueda -> persecucion. No consulta la
-    posicion del jugador para elegir destino salvo durante una persecucion confirmada.
+    Estados: acecho -> investigacion -> busqueda -> persecucion. Navega por ecos
+    imperfectos; solo comprueba proximidad fisica al jugador para cerrar la persecucion.
     """
     def __init__(self):
         super().__init__(enabled=False, collider=None)
+        self.amenaza_real = True
         self.color_sombra = color.rgb32(1, 2, 2)
         # Silueta irregular, casi fundida con la niebla. Sin ojos ni rasgos faciales.
         Entity(parent=self, model="cube", position=(0, 1.15, 0),
@@ -942,6 +1260,7 @@ class EntidadCiega(Entity):
         self.velocidad = 2.35
         self.t_perdida = 0.0
         self.distancia_previa = 999.0
+        self.t_reintento_activacion = 0.0
 
     def activar(self):
         """Aparece lejos, solo en una zona transitable conectada."""
@@ -970,6 +1289,7 @@ class EntidadCiega(Entity):
                 self.t_estado = random.uniform(4.0, 8.0)
                 self.t_pasos = random.uniform(1.0, 2.5)
                 self.t_perdida = 0.0
+                self.t_reintento_activacion = 0.0
                 return True
         return False
 
@@ -977,25 +1297,59 @@ class EntidadCiega(Entity):
         if not self.activa or E.fase != "juego":
             return
         distancia = math.hypot(self.x - x, self.z - z)
-        # La cordura baja aumenta el alcance, pero los muros amortiguan el sonido.
+        # La cordura baja aumenta el alcance, pero los muros amortiguan y distorsionan el sonido.
         locura = 1.0 - E.cordura / 100.0
         alcance = (7.0 + locura * 15.0) * max(0.35, intensidad)
         if distancia > alcance:
-            return
-        if not laberinto.linea_libre(self.x, self.z, x, z):
+            return False
+        bloqueado = not laberinto.linea_libre(self.x, self.z, x, z)
+        if bloqueado:
             alcance *= 0.62
-            if distancia > alcance:
-                return
+        if distancia > alcance:
+            return False
         calidad = max(0.0, 1.0 - distancia / max(alcance, 0.1))
-        self.confianza = min(1.0, self.confianza + intensidad * (0.20 + calidad * 0.48)
-                             * (0.75 + locura * 0.8))
-        # Solo guarda la fuente del ruido, no la posicion actual del jugador.
-        self.ultima_posicion = (x, z)
-        self.objetivo = (x, z)
-        if self.estado not in ("persecucion", "busqueda"):
+        claridad = 0.68 if bloqueado else 1.0
+        self.confianza = min(
+            1.0, self.confianza + intensidad * (0.18 + calidad * 0.50)
+            * (0.75 + locura * 0.8) * claridad
+        )
+
+        # No recibe coordenadas perfectas: distancia, ruido bajo y paredes degradan
+        # la localizacion. Esto tambien evita que el camino revele nuestra posicion.
+        error = (0.25 + (1.0 - calidad) * 2.4 + (1.0 - intensidad) * 1.3
+                 + locura * 0.45 + (1.1 if bloqueado else 0.0))
+        angulo = random.uniform(0.0, math.tau)
+        radio = math.sqrt(random.random()) * error
+        estimacion = (x + math.cos(angulo) * radio, z + math.sin(angulo) * radio)
+        self.ultima_posicion = estimacion
+        self.objetivo = estimacion
+        self.t_perdida = 0.0
+        if self.estado != "persecucion":
             self.estado = "investigacion"
             self.t_estado = 5.5 + self.confianza * 4.0
             self.t_ruta = 0.0
+        return True
+
+    @staticmethod
+    def _celda_objetivo(posicion):
+        """Convierte un eco aproximado en la celda transitable mas cercana."""
+        if posicion is None:
+            return None
+        gx, gz = laberinto.celda_de(*posicion)
+        gx = max(1, min(LADO - 2, gx))
+        gz = max(1, min(LADO - 2, gz))
+        if not laberinto.mapa[gz][gx]:
+            return gx, gz
+
+        for radio in range(1, 4):
+            candidatas = []
+            for cz in range(max(1, gz - radio), min(LADO - 1, gz + radio + 1)):
+                for cx in range(max(1, gx - radio), min(LADO - 1, gx + radio + 1)):
+                    if not laberinto.mapa[cz][cx]:
+                        candidatas.append((cx, cz))
+            if candidatas:
+                return min(candidatas, key=lambda celda: abs(celda[0] - gx) + abs(celda[1] - gz))
+        return None
 
     def actualizar(self, dt, corriendo):
         if not self.activa:
@@ -1003,6 +1357,7 @@ class EntidadCiega(Entity):
         if not laberinto.libre(self.x, self.z):
             self.activa = False
             self.enabled = False
+            self.t_reintento_activacion = 2.0
             return False
 
         locura = 1.0 - E.cordura / 100.0
@@ -1027,7 +1382,7 @@ class EntidadCiega(Entity):
             if self.confianza >= (0.86 - locura * 0.17):
                 self.estado = "persecucion"
                 self.t_perdida = 0.0
-                self.objetivo = (jugador.x, jugador.z)  # confirma al jugador solo en este umbral
+                self.objetivo = self.ultima_posicion
                 self.t_ruta = 0.0
             elif self.t_estado <= 0:
                 self.estado = "busqueda"
@@ -1039,7 +1394,7 @@ class EntidadCiega(Entity):
             if self.confianza >= (0.88 - locura * 0.18):
                 self.estado = "persecucion"
                 self.t_perdida = 0.0
-                self.objetivo = (jugador.x, jugador.z)
+                self.objetivo = self.ultima_posicion
                 self.t_ruta = 0.0
             elif self.t_estado <= 0 or self.confianza < 0.12:
                 self.estado = "acecho"
@@ -1053,7 +1408,7 @@ class EntidadCiega(Entity):
             # conocido y pierde confianza con el tiempo.
             if self.ultima_posicion:
                 self.objetivo = self.ultima_posicion
-            self.confianza = max(0.0, self.confianza - dt * (0.025 if locura > 0.65 else 0.055))
+            self.confianza = max(0.0, self.confianza - dt * (0.075 - locura * 0.02))
             if self.confianza < 0.28 and self.t_perdida > 3.0:
                 self.estado = "busqueda"
                 self.t_estado = 5.0
@@ -1064,12 +1419,10 @@ class EntidadCiega(Entity):
         self.t_ruta -= dt
         if self.t_ruta <= 0:
             if self.estado == "persecucion":
-                meta = laberinto.celda_de(jugador.x, jugador.z)
-                # La ruta apunta al ultimo lugar detectado; el jugador puede despistarla.
-                if self.ultima_posicion and self.t_perdida > 0.65:
-                    meta = laberinto.celda_de(*self.ultima_posicion)
+                # Incluso durante la persecucion solo sigue la ultima senal oida.
+                meta = self._celda_objetivo(self.ultima_posicion or self.objetivo)
             elif self.objetivo:
-                meta = laberinto.celda_de(*self.objetivo)
+                meta = self._celda_objetivo(self.objetivo)
             else:
                 meta = None
             inicio = laberinto.celda_de(self.x, self.z)
@@ -1100,7 +1453,8 @@ class EntidadCiega(Entity):
         # La forma se pierde en la niebla; a cordura baja se distingue un poco mas.
         self.y = 0.02 + math.sin(E.t * 2.2) * 0.035
         distancia_jugador = math.hypot(self.x - jugador.x, self.z - jugador.z)
-        if self.estado == "persecucion" and distancia_jugador < 1.25:
+        if (self.estado == "persecucion" and distancia_jugador < 1.25
+                and laberinto.linea_libre(self.x, self.z, jugador.x, jugador.z)):
             return True
         # No termina la partida por estar cerca durante el acecho: debe confirmar primero.
         return False
@@ -1303,12 +1657,12 @@ cord_fondo = Entity(parent=camera.ui, model="quad", origin=(-0.5, 0), position=(
                     scale=(0.25, 0.012), color=color.rgba32(0, 0, 0, 140), unlit=True)
 cord_barra = Entity(parent=camera.ui, model="quad", origin=(-0.5, 0), position=(-0.84, 0.318, -0.85),
                     scale=(0.25, 0.012), color=color.rgb32(170, 176, 150), unlit=True)
-objetivo = Text(parent=camera.ui, text="SIGUE LAS FLECHAS PINTADAS", position=(0, 0.43),
+objetivo = Text(parent=camera.ui, text="SIGUE LAS FLECHAS · BUSCA EL UMBRAL", position=(0, 0.43),
                 origin=(0, 0), scale=0.72, color=color.rgb32(182, 174, 135))
-centro = Text(parent=camera.ui, text="·", position=(0, 0), origin=(0, 0), scale=1.2,
+centro = Text(parent=camera.ui, text="+", position=(0, 0), origin=(0, 0), scale=1.2,
               color=color.rgba32(195, 190, 166, 150))
 mensaje = Text(parent=camera.ui,
-               text="WASD MOVER · SHIFT CORRER · ESPACIO SALTAR · F LINTERNA\n1 AGUA · 2 REFRESCO · RUEDA ZOOM",
+               text="WASD MOVER | SHIFT CORRER | ESPACIO SALTAR | F LINTERNA\n1 AGUA | 2 REFRESCO | RUEDA ZOOM",
                position=(-0.84, -0.46), origin=(-0.5, 0), scale=0.58,
                color=color.rgb32(146, 143, 128), background=True)
 energia_texto = Text(parent=camera.ui, text="AIRE", position=(-0.84, 0.287), scale=0.54,
@@ -1321,7 +1675,7 @@ energia_barra = Entity(parent=camera.ui, model="quad", origin=(-0.5, 0),
                        color=color.rgb32(153, 174, 120), unlit=True)
 zoom_texto = Text(parent=camera.ui, text="", position=(0.84, 0.38), origin=(1, 0),
                   scale=0.58, color=color.rgb32(171, 176, 154), enabled=False)
-inventario_texto = Text(parent=camera.ui, text="1 AGUA 0   ·   2 REFRESCO 0",
+inventario_texto = Text(parent=camera.ui, text="1 AGUA 0   |   2 REFRESCO 0",
                         position=(0.84, 0.32), origin=(1, 0), scale=0.64,
                         color=color.rgb32(191, 185, 157), background=True)
 amenaza_texto = Text(parent=camera.ui, text="", position=(0, 0.36), origin=(0, 0),
@@ -1342,24 +1696,327 @@ cam_texto = Text(parent=camera.ui, text="CAM-01   /   CINTA 01", position=(-0.84
                  scale=0.66, color=color.rgb32(171, 176, 154))
 reloj_cinta = Text(parent=camera.ui, text="00:00:00", position=(0.84, -0.44),
                    origin=(1, 0), scale=0.7, color=color.rgb32(190, 191, 170))
+decoracion_cinta = []
 for lado_x in (-0.86, 0.86):
     for lado_y in (-0.43, 0.43):
         sx = 1 if lado_x < 0 else -1
         sy = 1 if lado_y < 0 else -1
-        Entity(parent=camera.ui, model="quad", position=(lado_x + sx * 0.028, lado_y, -0.8),
-               scale=(0.056, 0.003), color=color.rgba32(205, 204, 183, 115), unlit=True)
-        Entity(parent=camera.ui, model="quad", position=(lado_x, lado_y + sy * 0.028, -0.8),
-               scale=(0.003, 0.056), color=color.rgba32(205, 204, 183, 115), unlit=True)
+        decoracion_cinta.append(Entity(parent=camera.ui, model="quad",
+                                       position=(lado_x + sx * 0.028, lado_y, -0.8),
+                                       scale=(0.056, 0.003),
+                                       color=color.rgba32(205, 204, 183, 115), unlit=True))
+        decoracion_cinta.append(Entity(parent=camera.ui, model="quad",
+                                       position=(lado_x, lado_y + sy * 0.028, -0.8),
+                                       scale=(0.003, 0.056),
+                                       color=color.rgba32(205, 204, 183, 115), unlit=True))
 banda_cinta = Entity(parent=camera.ui, model="quad", position=(0, -0.45, -0.78),
                      scale=(1.72, 0.006), color=color.rgba32(196, 190, 158, 9), unlit=True)
-Entity(parent=camera.ui, model="quad", position=(0, 0.485, -0.74),
-       scale=(1.72, 0.025), color=color.rgba32(0, 0, 0, 28), unlit=True)
-Entity(parent=camera.ui, model="quad", position=(0, -0.485, -0.74),
-       scale=(1.72, 0.025), color=color.rgba32(0, 0, 0, 35), unlit=True)
+decoracion_cinta.extend((
+    Entity(parent=camera.ui, model="quad", position=(0, 0.485, -0.74),
+           scale=(1.72, 0.025), color=color.rgba32(0, 0, 0, 28), unlit=True),
+    Entity(parent=camera.ui, model="quad", position=(0, -0.485, -0.74),
+           scale=(1.72, 0.025), color=color.rgba32(0, 0, 0, 35), unlit=True),
+))
 
 # Velo negro para los apagones (esta DETRAS del REC, asi la camara "sigue grabando").
 velo = Entity(parent=camera.ui, model="quad", scale=(2, 1), z=-0.6,
               color=color.rgba32(0, 0, 0, 0), unlit=True, enabled=False)
+
+# Agrupa la interfaz de partida para ocultarla por completo bajo el menú.
+hud_raiz = Entity(parent=camera.ui)
+for elemento in (
+    hud, cord_texto, cord_fondo, cord_barra, objetivo, centro, mensaje,
+    energia_texto, energia_fondo, energia_barra, zoom_texto, inventario_texto,
+    amenaza_texto, alerta, fin_texto, fin_sub, rec_dot, rec_texto, cam_texto,
+    reloj_cinta, banda_cinta, velo, *decoracion_cinta,
+):
+    elemento.parent = hud_raiz
+hud_raiz.enabled = False
+
+
+# ----------------------------------------------------------------------------
+# MENÚ PRINCIPAL Y RECORRIDO CINEMATOGRÁFICO
+# ----------------------------------------------------------------------------
+class BotonMenu(Entity):
+    """Botón UI propio, dibujado con una quad para no depender de texturas externas."""
+    def __init__(self, texto, posicion, accion, ancho=0.43):
+        super().__init__(parent=camera.ui, model="quad", collider="box",
+                         position=(posicion[0], posicion[1], -0.82),
+                         scale=(ancho, 0.064), color=color.rgb32(34, 36, 28), unlit=True)
+        self.accion = accion
+        self.color_base = color.rgb32(34, 36, 28)
+        self.color_activo = color.rgb32(91, 79, 43)
+        self.etiqueta = Text(parent=camera.ui, text=texto,
+                             position=(posicion[0], posicion[1] - 0.012, -0.92),
+                             origin=(0, 0), scale=0.78,
+                             color=color.rgb32(218, 213, 184))
+
+    def mostrar(self, visible):
+        self.enabled = visible
+        self.etiqueta.enabled = visible
+
+
+class MenuPrincipal:
+    """Menú sobre una toma lenta del laberinto; la simulación queda detenida."""
+    def __init__(self):
+        self.activo = False
+        self.pantalla = "principal"
+        self.indice = 0
+        self.partida_iniciada = False
+        self.reloj = 0.0
+        self.progreso = 0.0
+        self.direccion = 1
+        self.velocidad_camara = 0.18       # celdas por segundo
+        self.t_sombra = 0.0
+        self.t_siguiente_sombra = 17.0
+        self.recorrido = [laberinto.a_mundo(*celda) for celda in laberinto.camino]
+        if len(self.recorrido) < 2:
+            self.recorrido = [laberinto.a_mundo(1, 1), laberinto.a_mundo(2, 1)]
+
+        self.velo = Entity(parent=camera.ui, model="quad", scale=(2, 1), z=-0.70,
+                           color=color.rgba32(0, 0, 0, 90), unlit=True)
+        self.panel = Entity(parent=camera.ui, model="quad", position=(-0.52, 0, -0.76),
+                            scale=(0.86, 0.94), color=color.rgba32(10, 12, 9, 224), unlit=True)
+        self.acento = Entity(parent=camera.ui, model="quad", position=(-0.91, 0, -0.80),
+                             scale=(0.008, 0.94), color=color.rgb32(153, 129, 59), unlit=True)
+        self.sello = Text(parent=camera.ui, text="CINTA 01   /   NIVEL 0",
+                          position=(-0.52, 0.365, -0.94), origin=(0, 0), scale=0.62,
+                          color=color.rgb32(173, 166, 129))
+        self.titulo = Text(parent=camera.ui, text="BACKROOM: ENTITY",
+                           position=(-0.52, 0.27, -0.94), origin=(0, 0), scale=1.45,
+                           color=color.rgb32(222, 211, 160))
+        self.subtitulo = Text(parent=camera.ui,
+                              text="NO RECUERDAS HABER ENTRADO.",
+                              position=(-0.52, 0.205, -0.94), origin=(0, 0), scale=0.70,
+                              color=color.rgb32(161, 157, 132))
+        self.descripcion = Text(parent=camera.ui,
+                                text="La habitación intenta parecer real.\nCruza un umbral y el lugar será distinto al otro lado.",
+                                position=(-0.52, 0.145, -0.94), origin=(0, 0), scale=0.60,
+                                color=color.rgb32(143, 141, 122))
+        self.volumen_texto = Text(parent=camera.ui, text="VOLUMEN GENERAL  65%",
+                                  position=(-0.52, 0.10, -0.94), origin=(0, 0), scale=0.70,
+                                  color=color.rgb32(204, 198, 165), enabled=False)
+        self.ayuda = Text(parent=camera.ui,
+                          text="FLECHAS / ENTER  |  RATÓN PARA ELEGIR  |  ESC PARA VOLVER",
+                          position=(-0.52, -0.335, -0.94), origin=(0, 0), scale=0.48,
+                          color=color.rgb32(126, 127, 111))
+        self.pie = Text(parent=camera.ui, text="GRABACIÓN LOCAL  —  SEÑAL INESTABLE",
+                        position=(-0.52, -0.405, -0.94), origin=(0, 0), scale=0.46,
+                        color=color.rgb32(113, 111, 91))
+
+        self.botones_principales = [
+            BotonMenu("JUGAR", (-0.52, 0.035), self.iniciar_partida),
+            BotonMenu("OPCIONES", (-0.52, -0.065), self.abrir_opciones),
+            BotonMenu("SALIR", (-0.52, -0.165), application.quit),
+        ]
+        self.botones_opciones = [
+            BotonMenu("−", (-0.69, 0.015), lambda: self.ajustar_volumen(-0.05), ancho=0.11),
+            BotonMenu("+", (-0.35, 0.015), lambda: self.ajustar_volumen(0.05), ancho=0.11),
+            BotonMenu("EFECTOS VHS: ACTIVADOS", (-0.52, -0.10), self.alternar_shader, ancho=0.46),
+            BotonMenu("VOLVER", (-0.52, -0.205), self.volver_principal),
+        ]
+        self.actualizar_textos_opciones()
+        self.abrir()
+
+    def _botones_actuales(self):
+        return self.botones_opciones if self.pantalla == "opciones" else self.botones_principales
+
+    def _mostrar_pantalla(self):
+        opciones = self.pantalla == "opciones"
+        self.volumen_texto.enabled = opciones
+        self.sello.text = "AJUSTES DE LA GRABACIÓN" if opciones else "CINTA 01   /   NIVEL 0"
+        self.titulo.text = "OPCIONES" if opciones else "BACKROOM: ENTITY"
+        self.subtitulo.text = "AJUSTA LA SEÑAL ANTES DE ENTRAR." if opciones else "NO RECUERDAS HABER ENTRADO."
+        self.descripcion.text = ("← / → ajusta el volumen general.\nLos efectos VHS se pueden desactivar si afectan el rendimiento."
+                                 if opciones else
+                                 "La habitación intenta parecer real.\nCruza un umbral y el lugar será distinto al otro lado.")
+        for boton in self.botones_principales:
+            boton.mostrar(not opciones)
+        for boton in self.botones_opciones:
+            boton.mostrar(opciones)
+        self.indice = 0
+
+    def actualizar_textos_opciones(self):
+        self.volumen_texto.text = f"VOLUMEN GENERAL  {int(E.volumen * 100)}%"
+        shader_activo = "ACTIVADOS" if USAR_SHADER else "DESACTIVADOS"
+        self.botones_opciones[2].etiqueta.text = f"EFECTOS VHS: {shader_activo}"
+
+    def _aplicar_volumen(self):
+        if zumbido_ambiente:
+            base = max(0.32, 0.50 - min(E.nivel_actual, 3) * 0.045)
+            if laberinto.tiempo_aviso <= 5:
+                base += 0.16
+            zumbido_ambiente.volume = base * E.volumen
+
+    def ajustar_volumen(self, cambio):
+        E.volumen = max(0.0, min(1.0, round(E.volumen + cambio, 2)))
+        self.actualizar_textos_opciones()
+        self._aplicar_volumen()
+
+    def alternar_shader(self):
+        global USAR_SHADER
+        USAR_SHADER = not USAR_SHADER
+        camera.shader = shader_camara if USAR_SHADER else None
+        self.actualizar_textos_opciones()
+
+    def abrir_opciones(self):
+        self.pantalla = "opciones"
+        E.fase = "opciones"
+        self._mostrar_pantalla()
+
+    def volver_principal(self):
+        self.pantalla = "principal"
+        E.fase = "menu"
+        self._mostrar_pantalla()
+
+    def iniciar_partida(self):
+        reconstruir_mapa = self.partida_iniciada
+        self.partida_iniciada = True
+        self.activo = False
+        self.velo.enabled = False
+        self.panel.enabled = False
+        self.acento.enabled = False
+        for texto in (self.sello, self.titulo, self.subtitulo, self.descripcion,
+                      self.volumen_texto, self.ayuda, self.pie):
+            texto.enabled = False
+        for boton in self.botones_principales + self.botones_opciones:
+            boton.mostrar(False)
+        self.t_sombra = 0.0
+        entidad_ciega.activa = False
+        entidad_ciega.enabled = False
+        hud_raiz.enabled = True
+        reiniciar(reconstruir_mapa=reconstruir_mapa)
+
+    def abrir(self):
+        self.activo = True
+        self.pantalla = "principal"
+        self.progreso = 0.0
+        self.direccion = 1
+        self.reloj = 0.0
+        self.t_sombra = 0.0
+        self.t_siguiente_sombra = random.uniform(16.0, 28.0)
+        self._mostrar_pantalla()
+        self.velo.enabled = True
+        self.panel.enabled = True
+        self.acento.enabled = True
+        self.sello.enabled = True
+        self.titulo.enabled = True
+        self.subtitulo.enabled = True
+        self.descripcion.enabled = True
+        self.ayuda.enabled = True
+        self.pie.enabled = True
+        hud_raiz.enabled = False
+        E.fase = "menu"
+        jugador.speed = 0
+        jugador.gravity = 0
+        jugador.jump_height = 0
+        jugador.mouse_sensitivity = Vec2(0, 0)
+        jugador.camera_pivot.y = 1.65
+        jugador.camera_pivot.rotation = Vec3(0, 0, 0)
+        if self.recorrido:
+            inicio_x, inicio_z = self.recorrido[0]
+            jugador.position = (inicio_x, 0.2, inicio_z)
+        mouse.locked = False
+        mouse.visible = True
+        entidad_ciega.activa = False
+        entidad_ciega.enabled = False
+        self._aplicar_volumen()
+
+    def _punto_recorrido(self, progreso):
+        progreso = max(0.0, min(float(len(self.recorrido) - 1), progreso))
+        i = min(len(self.recorrido) - 2, int(progreso))
+        mezcla = progreso - i
+        a, b = self.recorrido[i], self.recorrido[i + 1]
+        return (a[0] + (b[0] - a[0]) * mezcla,
+                a[1] + (b[1] - a[1]) * mezcla)
+
+    def _actualizar_camara(self, dt):
+        maximo = len(self.recorrido) - 1
+        self.progreso += self.direccion * self.velocidad_camara * dt
+        if self.progreso >= maximo:
+            self.progreso = float(maximo)
+            self.direccion = -1
+        elif self.progreso <= 0:
+            self.progreso = 0.0
+            self.direccion = 1
+        x, z = self._punto_recorrido(self.progreso)
+        antes = self._punto_recorrido(self.progreso - self.direccion * 0.20)
+        despues = self._punto_recorrido(self.progreso + self.direccion * 0.20)
+        dx, dz = despues[0] - antes[0], despues[1] - antes[1]
+        if abs(dx) + abs(dz) > 0.001:
+            jugador.rotation_y = math.degrees(math.atan2(dx, dz))
+        jugador.position = (x, 0.2, z)
+        jugador.camera_pivot.y = 1.65
+        jugador.camera_pivot.rotation_x = math.sin(self.reloj * 0.43) * 2.0 - 1.0
+        jugador.camera_pivot.rotation_z = math.sin(self.reloj * 0.31) * 0.35
+        camera.position = (math.sin(self.reloj * 0.7) * 0.008,
+                           math.sin(self.reloj * 0.5) * 0.006, 0)
+
+    def _actualizar_sombra(self, dt):
+        if self.t_sombra > 0:
+            self.t_sombra -= dt
+            if self.t_sombra <= 0:
+                entidad_ciega.enabled = False
+            return
+        self.t_siguiente_sombra -= dt
+        if self.t_siguiente_sombra > 0 or len(self.recorrido) < 5:
+            return
+        adelante = random.randint(3, 6) * self.direccion
+        indice = int(max(0, min(len(self.recorrido) - 1, self.progreso + adelante)))
+        sx, sz = self.recorrido[indice]
+        entidad_ciega.position = (sx, 0.02, sz)
+        dx, dz = jugador.x - sx, jugador.z - sz
+        entidad_ciega.rotation_y = math.degrees(math.atan2(dx, dz))
+        entidad_ciega.scale = (0.78, 0.92, 0.78)
+        entidad_ciega.enabled = True
+        self.t_sombra = random.uniform(1.0, 2.0)
+        self.t_siguiente_sombra = random.uniform(20.0, 34.0)
+
+    def actualizar(self, dt):
+        if not self.activo:
+            return
+        self.reloj += dt
+        self._actualizar_camara(dt)
+        self._actualizar_sombra(dt)
+        botones = self._botones_actuales()
+        hovered = mouse.hovered_entity
+        for i, boton in enumerate(botones):
+            if hovered is boton:
+                boton.color = boton.color_activo
+            else:
+                boton.color = boton.color_activo if i == self.indice else boton.color_base
+        if USAR_SHADER:
+            camera.set_shader_input("tiempo", self.reloj)
+            camera.set_shader_input("glitch", 0.025 + 0.025 * (0.5 + 0.5 * math.sin(self.reloj * 0.37)))
+            camera.set_shader_input("locura", 0.08 + 0.025 * math.sin(self.reloj * 0.19))
+
+    def procesar_input(self, key):
+        botones = self._botones_actuales()
+        if key == "escape":
+            if self.pantalla == "opciones":
+                self.volver_principal()
+            else:
+                application.quit()
+            return
+        if key in ("up arrow", "w"):
+            self.indice = (self.indice - 1) % len(botones)
+        elif key in ("down arrow", "s"):
+            self.indice = (self.indice + 1) % len(botones)
+        elif self.pantalla == "opciones" and key == "left arrow":
+            self.ajustar_volumen(-0.05)
+        elif self.pantalla == "opciones" and key == "right arrow":
+            self.ajustar_volumen(0.05)
+        elif key in ("enter", "space"):
+            botones[self.indice].accion()
+        elif key == "left mouse down":
+            hovered = mouse.hovered_entity
+            for boton in botones:
+                if hovered is boton:
+                    boton.accion()
+                    break
+
+
+main_menu = MenuPrincipal()
 
 # ----------------------------------------------------------------------------
 # SONIDO DE PASOS
@@ -1376,7 +2033,7 @@ def reproducir_paso(volumen=0.34):
     audio = pasos[paso_siguiente % len(pasos)]
     paso_siguiente += 1
     try:
-        audio.volume = volumen
+        audio.volume = volumen * E.volumen
         audio.play()
     except Exception:
         pass
@@ -1410,10 +2067,10 @@ def recoger_consumibles():
         if math.hypot(jugador.x - objeto.x, jugador.z - objeto.z) < 1.25:
             if objeto.tipo == "agua":
                 E.agua_inventario += 1
-                mostrar_alerta("AGUA DE ALMENDRA · PULSA 1 PARA USAR", 2.2)
+                mostrar_alerta("AGUA DE ALMENDRA | PULSA 1 PARA USAR", 2.2)
             else:
                 E.refresco_inventario += 1
-                mostrar_alerta("REFRESCO · PULSA 2 PARA USAR", 2.2)
+                mostrar_alerta("REFRESCO | PULSA 2 PARA USAR", 2.2)
             consumibles.remove(objeto)
             destroy(objeto)
 
@@ -1435,7 +2092,7 @@ def consumir_refresco():
         return
     E.refresco_inventario -= 1
     E.refresco_t = max(E.refresco_t, DURACION_REFRESCO)
-    mostrar_alerta("REFRESCO · MAS RAPIDO Y RECUPERAS AIRE", 2.2)
+    mostrar_alerta("REFRESCO | MAS RAPIDO Y RECUPERAS AIRE", 2.2)
 
 
 def limpiar_consumibles():
@@ -1463,16 +2120,52 @@ def terminar(titulo):
     jugador.gravity = 1
     jugador.jump_height = 0.65
     fin_texto.text = titulo
+    fin_sub.text = "R REINICIAR   |   ESC MENÚ PRINCIPAL"
     alerta.enabled = False
     amenaza_texto.enabled = False
     silueta.ocultar()
 
 
-def reiniciar():
-    global zoom_fov
+def cruzar_umbral():
+    """Continúa la grabación en otra zona cuando el jugador llega a la falsa salida."""
+    if laberinto.reconstruccion_en_curso:
+        return
+    siguiente = E.nivel_actual + 1
+    if not laberinto.iniciar_nueva_zona(jugador, siguiente):
+        return
+    E.nivel_actual = siguiente
+    E.fundido = 1.8
+    E.glitch = max(E.glitch, 1.4)
+    E.cordura = max(0.0, E.cordura - 4.0)
+    E.techo = max(35.0, E.techo - 3.0)
+    E.t_evento_mental = max(E.t_evento_mental, 8.0)
+    E.t_silueta = random.uniform(12.0, 20.0)
+    E.t_mensaje = random.uniform(18.0, 30.0)
+    E.t_consumible = 7.0
+    E.ecos.clear()
+    limpiar_consumibles()
+    silueta.ocultar()
+    entidad_ciega.activa = False
+    entidad_ciega.enabled = False
+    entidad_ciega.estado = "acecho"
+    entidad_ciega.confianza = 0.0
+    entidad_ciega.ruta = []
+    entidad_ciega.objetivo = None
+    entidad_ciega.ultima_posicion = None
+    entidad_ciega.t_reintento_activacion = 8.0
+    amenaza_texto.enabled = False
+    mostrar_alerta("NO ERA LA SALIDA. SIGUE GRABANDO.", 3.2)
+
+
+def reiniciar(reconstruir_mapa=True):
+    global zoom_fov, intro_activo, intro_reloj
+    E.t = 0.0
+    E.ultimo_seg = -1
+    E.ultima_cordura = -1
     E.cordura = 100.0
     E.techo = 100.0
     E.cambios = 0
+    E.nivel_actual = 0
     E.energia_sprint = ENERGIA_SPRINT_MAX
     E.t_corrida = 0.0
     E.t_consumible = 9.0
@@ -1481,6 +2174,7 @@ def reiniciar():
     E.refresco_t = 0.0
     E.zoom_ui_t = 0.0
     E.fallo_linterna = 0.0
+    E.linterna = True
     E.susto_activo = False
     E.susto_t = 0.0
     E.susto_enfriamiento = 0.0
@@ -1492,6 +2186,10 @@ def reiniciar():
     E.t_silueta = random.uniform(20, 35)
     E.t_reloj = random.uniform(20, 35)
     E.t_mensaje = random.uniform(25, 40)
+    E.t_evento_mental = 0.0
+    E.t_glitch = random.uniform(8.0, 14.0)
+    E.ultima_fase_cordura = None
+    E.mov_antes = False
     limpiar_consumibles()
     entidad_ciega.activa = False
     entidad_ciega.enabled = False
@@ -1501,16 +2199,26 @@ def reiniciar():
     entidad_ciega.objetivo = None
     entidad_ciega.ultima_posicion = None
     E.corrida_ruido_t = 0.0
+    entidad_ciega.t_reintento_activacion = 0.0
     amenaza_texto.enabled = False
-    laberinto.reconstruir(None)
+    if reconstruir_mapa:
+        laberinto.nivel = 0
+        laberinto.perfil = perfil_de_zona(0)
+        laberinto.reconstruir(None)
     x, z = laberinto.a_mundo(1, 1)
     jugador.position = (x, 0.2, z)
-    jugador.rotation_y = rumbo_inicial
-    jugador.camera_pivot.rotation_x = 0
-    jugador.mouse_sensitivity = Vec2(40, 40)
-    jugador.gravity = 1
-    jugador.jump_height = 0.65
-    jugador.speed = VELOCIDAD_CAMINAR
+    jugador.rotation_y = rumbo_inicial - 5
+    jugador.camera_pivot.y = 0.34
+    jugador.camera_pivot.rotation = Vec3(68, 0, -4)
+    jugador.mouse_sensitivity = Vec2(0, 0)
+    jugador.gravity = 0
+    jugador.jump_height = 0
+    jugador.speed = 0
+    jugador.grounded = False
+    intro_activo = True
+    intro_reloj = 0.0
+    mouse.locked = True
+    mouse.visible = False
     zoom_fov = FOV_NORMAL
     zoom_texto.enabled = False
     fin_texto.enabled = False
@@ -1520,6 +2228,11 @@ def reiniciar():
 
 def input(key):
     global zoom_fov
+    if main_menu.activo:
+        main_menu.procesar_input(key)
+        return
+    if laberinto.reconstruccion_en_curso and key != "escape":
+        return
     if E.susto_activo and key != "escape":
         return
     if key == "1" and E.fase == "juego" and not intro_activo:
@@ -1531,7 +2244,7 @@ def input(key):
     elif key in ("scroll up", "scroll down") and E.fase == "juego" and not intro_activo:
         cambio_zoom = -PASO_ZOOM if key == "scroll up" else PASO_ZOOM
         zoom_fov = max(FOV_ZOOM_MIN, min(FOV_ZOOM_MAX, zoom_fov + cambio_zoom))
-        zoom_texto.text = f"ZOOM {int(FOV_NORMAL * 100 / zoom_fov)}%  ·  V RESTABLECER"
+        zoom_texto.text = f"ZOOM {int(FOV_NORMAL * 100 / zoom_fov)}%  |  V RESTABLECER"
         zoom_texto.enabled = True
         E.zoom_ui_t = 2.0
     elif key == "v" and E.fase == "juego":
@@ -1541,6 +2254,8 @@ def input(key):
         E.zoom_ui_t = 1.2
     elif key == "r" and E.fase == "fin" and E.fin_t > 2.0:
         reiniciar()
+    elif key == "escape" and E.fase == "fin":
+        main_menu.abrir()
     elif key == "escape":
         application.quit()
 
@@ -1560,19 +2275,60 @@ def actualizar_cordura(dt):
         E.cordura = max(0.0, E.cordura + delta * dt)
 
 
+def nivel_cordura(valor):
+    """Nombre y color del estado mental para comunicar la escalada en el HUD."""
+    if valor >= 75:
+        return "ESTABLE", color.rgb32(160, 181, 139)
+    if valor >= 50:
+        return "INQUIETA", color.rgb32(198, 183, 105)
+    if valor >= 25:
+        return "ALTERADA", color.rgb32(207, 132, 76)
+    return "CRITICA", color.rgb32(204, 79, 70)
+
+
+def agregar_eco_fantasma(cantidad=1):
+    """Agenda pasos falsos con un limite para evitar acumulaciones y saturacion."""
+    espacio = max(0, 5 - len(E.ecos))
+    for _ in range(min(cantidad, espacio)):
+        E.ecos.append(random.uniform(0.45, 1.2))
+
+
+def posponer_otros_eventos(excepto):
+    """Evita que temporizadores vencidos se disparen en cadena tras un susto."""
+    pausa = E.t_evento_mental + random.uniform(3.0, 7.0)
+    if excepto != "silueta":
+        E.t_silueta = max(E.t_silueta, pausa)
+    if excepto != "reloj":
+        E.t_reloj = max(E.t_reloj, pausa)
+    if excepto != "mensaje":
+        E.t_mensaje = max(E.t_mensaje, pausa)
+
+
 def actualizar_alucinaciones(dt, moviendo, corriendo=False):
     c = E.cordura
+    E.t_evento_mental = max(0.0, E.t_evento_mental - dt)
+    E.t_glitch = max(0.0, E.t_glitch - dt)
 
-    # La cinta pierde estabilidad cada vez mas a menudo cuando baja la cordura.
-    if c < 65 and random.random() < dt * (0.06 + (65 - c) * 0.012):
-        E.glitch = max(E.glitch, random.uniform(0.18, 0.46))
+    # La cinta se degrada a intervalos; la frecuencia e intensidad escalan con
+    # la cordura, pero nunca dependen de una tirada aleatoria cada frame.
+    if c < 65 and E.t_glitch <= 0:
+        escala = (65.0 - c) / 65.0
+        if random.random() < 0.48 + escala * 0.42:
+            E.glitch = max(E.glitch, random.uniform(0.16, 0.30 + escala * 0.38))
+        E.t_glitch = random.uniform(17.0, 27.0) * (0.34 + 0.66 * c / 100.0)
 
     # 1) Siluetas que se asoman junto a esquinas (menos de 82).
     if c < 82:
         E.t_silueta -= dt * (1.45 if corriendo else 1.0)
-        if not silueta.enabled and E.t_silueta <= 0:
+        if (not silueta.enabled and E.t_silueta <= 0
+                and E.t_evento_mental <= 0):
             if silueta.intentar_aparecer():
-                if c < 55:
+                E.t_evento_mental = random.uniform(8.0, 12.0)
+                posponer_otros_eventos("silueta")
+                # El susto se vuelve mas probable al entrar en estado critico,
+                # pero no acompaña todas las apariciones de la figura.
+                probabilidad_susto = min(0.82, 0.28 + max(0.0, 55 - c) * 0.018)
+                if c < 55 and random.random() < probabilidad_susto:
                     iniciar_susto()
                 E.t_silueta = random.uniform(10, 22) * (0.35 + 0.65 * c / 100.0)
             else:
@@ -1586,28 +2342,35 @@ def actualizar_alucinaciones(dt, moviendo, corriendo=False):
             E.ecos.pop(i)
             reproducir_paso(0.14)
     if E.mov_antes and not moviendo and c < 72:
-        E.ecos.extend([0.7 * (k + 1) for k in range(random.randint(2, 4))])
+        agregar_eco_fantasma(random.randint(2, 4))
     E.mov_antes = moviendo
 
     # 3) El reloj de la cinta salta hacia atras (menos de 55).
     if c < 50:
         E.t_reloj -= dt
-        if E.t_reloj <= 0:
+        if E.t_reloj <= 0 and E.t_evento_mental <= 0:
             E.desfase_reloj = max(-E.t + 1.0, E.desfase_reloj - random.uniform(20, 160))
-            E.t_reloj = random.uniform(15, 35)
+            E.t_reloj = random.uniform(18, 34) * (0.55 + 0.45 * c / 100.0)
             E.glitch = max(E.glitch, 0.35)
+            E.t_evento_mental = random.uniform(8.0, 12.0)
+            posponer_otros_eventos("reloj")
 
     # 4) Mensajes que parpadean en pantalla (menos de 45).
     if c < 40:
         E.t_mensaje -= dt
-        if E.t_mensaje <= 0:
+        if E.t_mensaje <= 0 and E.t_evento_mental <= 0:
             mostrar_alerta(random.choice(FRASES_LOCURA), 0.3)
             E.glitch = max(E.glitch, 0.7)
-            E.t_mensaje = random.uniform(18, 40)
+            E.t_mensaje = random.uniform(22, 42) * (0.60 + 0.40 * c / 100.0)
+            E.t_evento_mental = random.uniform(7.0, 11.0)
+            posponer_otros_eventos("mensaje")
 
 
 def update():
     dt = min(time.dt, 1 / 20)
+    if main_menu.activo:
+        main_menu.actualizar(dt)
+        return
     E.t += dt
     actualizar_intro(dt)
 
@@ -1618,6 +2381,9 @@ def update():
         m, s = divmod(seg_total, 60)
         h, m = divmod(m, 60)
         reloj_cinta.text = f"{h:02d}:{m:02d}:{s:02d}"
+    etiqueta_zona = f"CAM-01   /   NIVEL {E.nivel_actual:02d}"
+    if cam_texto.text != etiqueta_zona:
+        cam_texto.text = etiqueta_zona
     rec_dot.enabled = int(E.t * 2) % 2 == 0
     banda_cinta.y = 0.47 - (E.t * 0.035 % 0.94)
 
@@ -1631,6 +2397,21 @@ def update():
         aplicar_velo(min(1.0, E.fin_t / 2.0))
         aplicar_shader(dt)
         return
+
+    cambio = False
+    cambio_nivel = False
+    if laberinto.reconstruccion_en_curso:
+        cambio = laberinto.avanzar_reconstruccion()
+        if cambio:
+            cambio_nivel = laberinto.nivel_acaba_de_cambiar
+            laberinto.nivel_acaba_de_cambiar = False
+        if not cambio:
+            # El fundido que anuncia el cambio cubre la construcción progresiva.
+            jugador.speed = 0
+            E.fundido = 1.0
+            aplicar_velo(1.0)
+            aplicar_shader(dt)
+            return
 
     if not intro_activo and E.refresco_t > 0:
         E.refresco_t = max(0.0, E.refresco_t - dt)
@@ -1658,7 +2439,19 @@ def update():
 
     # --- movimiento, cambio del laberinto y pasos ---
     posicion_anterior = Vec3(jugador.x, 0, jugador.z)
-    cambio = laberinto.actualizar(dt, jugador)
+    if not cambio:
+        laberinto.actualizar(dt, jugador)
+        if laberinto.reconstruccion_en_curso:
+            cambio = laberinto.avanzar_reconstruccion()
+            if cambio:
+                cambio_nivel = laberinto.nivel_acaba_de_cambiar
+                laberinto.nivel_acaba_de_cambiar = False
+            if not cambio:
+                jugador.speed = 0
+                E.fundido = 1.0
+                aplicar_velo(1.0)
+                aplicar_shader(dt)
+                return
     posicion_actual = Vec3(jugador.x, 0, jugador.z)
     desplaz = (posicion_actual - posicion_anterior).length()
     moviendo = desplaz > 0.002 and not intro_activo
@@ -1677,12 +2470,23 @@ def update():
             distancia_paso -= paso_actual
             # Eco fantasma: cuanta menos cordura, mas probable.
             if E.cordura < 75 and random.random() < (75 - E.cordura) / 75 * 0.8:
-                E.ecos.append(random.uniform(0.3, 0.6))
+                agregar_eco_fantasma()
     else:
         distancia_paso = min(distancia_paso, 0.35)
 
     # --- eventos ---
-    if cambio:
+    if cambio and cambio_nivel:
+        limpiar_consumibles()
+        E.t_consumible = 7.0
+        entidad_ciega.ruta = []
+        entidad_ciega.t_ruta = 0.0
+        E.t_evento_mental = max(E.t_evento_mental, 8.0)
+        posponer_otros_eventos("cambio")
+        E.fundido = 1.15
+        E.glitch = max(E.glitch, 0.85)
+        silueta.ocultar()
+        mostrar_alerta(f"{laberinto.perfil['nombre']}\nNO RECUERDAS HABER LLEGADO", 3.5)
+    elif cambio:
         limpiar_consumibles()
         E.t_consumible = 5.0
         entidad_ciega.ruta = []
@@ -1690,13 +2494,18 @@ def update():
         E.cambios += 1
         E.techo = max(35.0, 100.0 - 8.0 * E.cambios)
         E.cordura = max(0.0, E.cordura - 8.0)
+        E.t_evento_mental = max(E.t_evento_mental, 10.0)
+        posponer_otros_eventos("cambio")
         E.fundido = 1.7
         E.glitch = 1.25
         silueta.ocultar()
+        entidad_ciega.t_reintento_activacion = 0.0
         mostrar_alerta("LAS PAREDES SE HAN MOVIDO", 3.0)
     if laberinto.observar_imitacion(jugador, dt):
         E.cordura = max(0.0, E.cordura - 12.0)
         E.glitch = 2.0
+        E.t_evento_mental = max(E.t_evento_mental, 10.0)
+        posponer_otros_eventos("puerta")
         mostrar_alerta("LA PUERTA NUNCA ESTUVO AHI", 3.0)
 
     # --- cordura y alucinaciones ---
@@ -1707,11 +2516,18 @@ def update():
         actualizar_susto(dt)
 
         # Segunda amenaza: no ve al jugador; necesita reunir suficientes señales.
-        if (not entidad_ciega.activa and E.fase == "juego"
+        entidad_ciega.t_reintento_activacion = max(
+            0.0, entidad_ciega.t_reintento_activacion - dt)
+        if (not entidad_ciega.activa and entidad_ciega.t_reintento_activacion <= 0
+                and E.fase == "juego"
                 and (E.t_corrida >= T_ENTIDAD_CIEGA or E.cordura <= 48)):
             if entidad_ciega.activar():
                 E.glitch = max(E.glitch, 0.38)
                 mostrar_alerta("NO HAGAS RUIDO", 2.4)
+            else:
+                # Si no hay un punto válido en este mapa, repetir la búsqueda cada
+                # frame puede causar tirones. El siguiente intento será tras 2 s.
+                entidad_ciega.t_reintento_activacion = 2.0
         if entidad_ciega.activa:
             if corriendo:
                 E.corrida_ruido_t -= dt
@@ -1739,7 +2555,8 @@ def update():
 
         sx, sz = laberinto.posicion_salida()
         if math.hypot(jugador.x - sx, jugador.z - sz) < 2.2:
-            terminar("SALISTE... O ESO CREES")
+            cruzar_umbral()
+            return
         elif E.cordura <= 0 and not E.susto_activo:
             terminar("YA NO RECUERDAS LA SALIDA")
 
@@ -1753,9 +2570,9 @@ def update():
     nuevo = f"LINTERNA: {'ENCENDIDA' if E.linterna else 'APAGADA'}"
     if nuevo != hud.text:
         hud.text = nuevo
-    contador = f"1 AGUA {E.agua_inventario}   ·   2 REFRESCO {E.refresco_inventario}"
+    contador = f"1 AGUA {E.agua_inventario}   |   2 REFRESCO {E.refresco_inventario}"
     if E.refresco_t > 0:
-        contador += f"   ·   TURBO {E.refresco_t:0.0f}s"
+        contador += f"   |   TURBO {E.refresco_t:0.0f}s"
     if contador != inventario_texto.text:
         inventario_texto.text = contador
     cint = int(E.cordura)
@@ -1764,6 +2581,11 @@ def update():
         cord_barra.scale_x = 0.25 * E.cordura / 100.0
         l = 1.0 - E.cordura / 100.0
         cord_barra.color = color.rgb32(int(170 + 60 * l), int(176 - 120 * l), int(150 - 110 * l))
+        fase, tono_fase = nivel_cordura(E.cordura)
+        if fase != E.ultima_fase_cordura:
+            E.ultima_fase_cordura = fase
+            cord_texto.text = f"CORDURA | {fase}"
+            cord_texto.color = tono_fase
 
     energia_int = int(E.energia_sprint)
     if energia_int != E.ultima_energia_sprint:
@@ -1794,7 +2616,10 @@ def update():
 
     # --- zumbido: sube al acercarse un cambio ---
     if zumbido_ambiente:
-        objetivo_vol = 0.66 if laberinto.tiempo_aviso <= 5 else 0.50
+        base_ambiente = max(0.32, 0.50 - min(E.nivel_actual, 3) * 0.045)
+        if laberinto.tiempo_aviso <= 5:
+            base_ambiente += 0.16
+        objetivo_vol = base_ambiente * E.volumen
         if zumbido_ambiente.volume != objetivo_vol:
             zumbido_ambiente.volume = objetivo_vol
 
