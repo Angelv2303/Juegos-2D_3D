@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Etapa 5 · Semáforos multiagente</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#1d2330;--mut:#6b7385;--line:#e1e4ea;--road:#cfd3dc;--grass:#dfeadb;--bld:#c3cadb;--acc:#4a6cf7;--car:#4a6cf7;--red:#e5484d;--grn:#30a46c;--amb:#f5a524;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f1115;--card:#171a21;--ink:#e8eaf0;--mut:#8b93a7;--line:#262b36;--road:#363c49;--grass:#1c2a20;--bld:#2d3345;--acc:#7c9cff;--car:#7c9cff}}
+:root[data-theme="dark"]{--bg:#0f1115;--card:#171a21;--ink:#e8eaf0;--mut:#8b93a7;--line:#262b36;--road:#363c49;--grass:#1c2a20;--bld:#2d3345;--acc:#7c9cff;--car:#7c9cff}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:760px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:0 0 2px}p.sub{color:var(--mut);margin:0 0 12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px;margin-bottom:12px}
+canvas{width:100%;max-width:720px;height:auto;display:block;border-radius:10px}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+button{background:var(--acc);color:#fff;border:0;border-radius:9px;padding:8px 12px;font:inherit;cursor:pointer}
+button.alt{background:transparent;color:var(--ink);border:1px solid var(--line)}
+button.bad{background:var(--red)}
+label{display:flex;gap:6px;align-items:center;color:var(--mut);font-size:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}
+.m{border:1px solid var(--line);border-radius:10px;padding:8px}.m b{display:block;font-size:22px}.m span{color:var(--mut);font-size:13px}
+#estado{font-size:14px;color:var(--mut);min-height:21px}
+</style></head><body><main>
+<h1>🚦 Dos semáforos, dos agentes</h1>
+<p class="sub">Cada cruce decide solo con lo que ve. El cruce A puede avisar a B con mensajes.</p>
+<div class="card"><canvas id="cv" width="1440" height="680" aria-label="Simulación de dos cruces"></canvas></div>
+<div class="card"><div class="bar">
+<button id="bp">Pausa</button>
+<button id="bf" class="bad">Hacer fallar a B</button>
+<button id="br" class="alt">Reiniciar</button>
+<label><input type="checkbox" id="com" checked> Comunicación A→B</label>
+<label>Velocidad <input type="range" id="vel" min="1" max="10" value="5"></label>
+<label>Tope de justicia <input type="range" id="tope" min="2" max="10" value="6"><span id="tv">6</span></label>
+</div><div id="estado"></div></div>
+<div class="grid">
+<div class="m"><b id="m1">0</b><span>Espera media (autos)</span></div>
+<div class="m"><b id="m2">0%</b><span>Autos de A que hallan rojo en B</span></div>
+<div class="m"><b id="m3">0</b><span>Cola NS de B (promedio)</span></div>
+<div class="m"><b id="m4">0</b><span>Pasos simulados</span></div>
+</div>
+<p class="sub" style="margin-top:12px">Prueba: apaga la comunicación y compara los números; luego haz fallar a B y observa que A sigue funcionando por su cuenta.</p>
+</main>
+<script>
+const VIAJE=3,MIN=3,ANT=2,P={A:{NS:.3,EW:.4},B:{NS:.3,EW:.05}};
+const $=id=>document.getElementById(id),cv=$('cv'),g=cv.getContext('2d');
+let S,pausa=false;
+function nuevo(){S={A:{c:{NS:0,EW:0},v:'NS'},B:{c:{NS:0,EW:0},v:'NS'},tA:0,tB:0,av:[],cam:Array(VIAJE).fill(0),n:0,esp:0,ll:0,rojo:0,nsB:0,falla:false,flash:0,pA:null,pB:null,last:performance.now(),delay:300,fp:1,ped:{A:{y:140,d:1},B:{y:200,d:-1}}}}
+const com=()=>$('com').checked,tope=()=>+$('tope').value;
+function llegan(X,p){for(const k in p)if(Math.random()<p[k])X.c[k]++}
+function otra(v){return v==='NS'?'EW':'NS'}
+function paso(){
+ llegan(S.A,P.A);llegan(S.B,P.B);
+ const l=S.cam.shift();S.B.c.EW+=l;
+ if(l){S.ll+=l;if(S.B.v!=='EW')S.rojo+=l}
+ S.av=S.av.map(t=>t-1).filter(t=>t>=-1);
+ S.tA++;const oA=otra(S.A.v);
+ if(S.tA>=MIN&&S.A.c[oA]>S.A.c[S.A.v]){S.A.v=oA;S.tA=0}
+ let ch=false;S.tB++;
+ if(S.falla){if(S.tB%10===0)ch=true}
+ else{const v=S.B.v,o=otra(v),vien=com()&&S.av.some(t=>t<=ANT),just=S.B.c.NS<tope();
+  if(vien&&just&&v!=='EW'&&S.tB>=MIN){ch=true}
+  else if(vien&&just&&v==='EW'){}
+  else if(S.tB>=MIN&&S.B.c[o]>S.B.c[v]){ch=true}
+  if(ch)S.tB=0}
+ if(ch)S.B.v=otra(S.B.v);
+ const sA=S.A.c[S.A.v]>0;if(sA)S.A.c[S.A.v]--;S.pA=sA?S.A.v:null;
+ const salio=sA&&S.A.v==='EW';
+ const sB=S.B.c[S.B.v]>0;if(sB)S.B.c[S.B.v]--;S.pB=sB?S.B.v:null;
+ S.cam.push(salio?1:0);
+ if(salio&&com()&&!S.falla)S.av.push(VIAJE);
+ S.n++;S.esp+=S.A.c.NS+S.A.c.EW+S.B.c.NS+S.B.c.EW;S.nsB+=S.B.c.NS;
+}
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const COL=['#e5484d','#f5a524','#30a46c','#4a6cf7','#a259ff','#14b8c4'];
+const XA=210,XB=510,LN=180;
+function car(x,y,col,dir){g.save();g.translate(x,y);if(dir==='NS')g.rotate(Math.PI/2);
+ g.fillStyle='#222';g.fillRect(-8,-8,5,2);g.fillRect(3,-8,5,2);g.fillRect(-8,6,5,2);g.fillRect(3,6,5,2);
+ g.fillStyle=col;g.beginPath();g.roundRect?g.roundRect(-11,-6,22,12,3):g.rect(-11,-6,22,12);g.fill();
+ g.fillStyle='rgba(255,255,255,.78)';g.fillRect(2,-4.5,5,9);g.fillRect(-8,-4.5,3,9);g.restore()}
+function tree(x,y){g.fillStyle='#7a5a3a';g.fillRect(x-1.5,y,3,7);g.fillStyle='#3f9a56';g.beginPath();g.arc(x,y-2,8,0,7);g.fill()}
+function bld(x,y,w,h,i){g.globalAlpha=i%2?.85:1;g.fillStyle=css('--bld');g.fillRect(x,y,w,h);g.globalAlpha=1;g.fillStyle='rgba(255,255,255,.5)';for(let a=x+8;a<x+w-8;a+=14)for(let b=y+8;b<y+h-8;b+=14)g.fillRect(a,b,6,6)}
+function light(x,y,on,warn){g.fillStyle='#555';g.fillRect(x-1,y+15,2,9);g.fillStyle='#1f2229';g.fillRect(x-7,y-16,14,32);
+ [['--red','R'],['--amb','A'],['--grn','G']].forEach(([v,k],i)=>{g.globalAlpha=on===k?1:.2;g.fillStyle=css(v);g.beginPath();g.arc(x,y-9+i*9,3.6,0,7);g.fill()});g.globalAlpha=1;
+ if(warn){g.strokeStyle=css('--amb');g.lineWidth=2;g.strokeRect(x-9,y-18,18,36)}}
+function ped(x,y,t,col){const s=Math.sin(t/110)*3;g.strokeStyle=col;g.lineWidth=2;g.beginPath();g.moveTo(x,y-7);g.lineTo(x,y);g.moveTo(x,y);g.lineTo(x-s,y+6);g.moveTo(x,y);g.lineTo(x+s,y+6);g.moveTo(x-3,y-4);g.lineTo(x+3,y-4);g.stroke();g.fillStyle='#f2c9a0';g.beginPath();g.arc(x,y-10,3.2,0,7);g.fill()}
+const tx=i=>XA+22+(XB-XA-78)*(1-(i+.5)/VIAJE);
+function draw(){
+ const W=720,H=340,now=performance.now();g.setTransform(2,0,0,2,0,0);
+ const f=pausa?S.fp:Math.min(1,(now-S.last)/S.delay);S.fp=f;
+ g.fillStyle=css('--grass');g.fillRect(0,0,W,H);
+ [[24,24,90,70],[130,40,48,90],[250,18,100,76],[370,36,92,62],[550,20,70,80],[640,40,60,70],[20,215,80,90],[120,230,56,72],[250,225,90,80],[360,225,100,80],[550,225,64,88],[630,210,70,100]].forEach((b,i)=>bld(...b,i));
+ [[240,110],[480,120],[180,205],[240,318],[480,318],[540,110],[690,200]].forEach(t=>tree(...t));
+ const road=css('--road'),ink=css('--ink');
+ g.fillStyle=road;g.fillRect(0,150,W,40);g.fillRect(XA-20,0,40,H);g.fillRect(XB-20,0,40,H);
+ g.strokeStyle='rgba(255,255,255,.6)';g.lineWidth=2;g.setLineDash([9,9]);
+ g.beginPath();g.moveTo(0,170);g.lineTo(W,170);[XA,XB].forEach(x=>{g.moveTo(x,0);g.lineTo(x,H)});g.stroke();g.setLineDash([]);
+ g.fillStyle=road;g.fillRect(XA-20,150,40,40);g.fillRect(XB-20,150,40,40);
+ [[S.A,XA,'A','pA'],[S.B,XB,'B','pB']].forEach(([X,cx,k,pk])=>{
+  g.fillStyle='rgba(255,255,255,.85)';
+  for(let y=152;y<188;y+=6)g.fillRect(cx-40,y,14,3);
+  for(let x=cx-18;x<cx+18;x+=6)g.fillRect(x,132,3,13);
+  g.fillRect(cx-44,150,3,40);g.fillRect(cx-20,128,20,3);
+  light(cx-52,204,X.v==='EW'?'G':'R',S.falla&&k==='B'&&S.flash%40<20);light(cx+34,110,X.v==='NS'?'G':'R',S.falla&&k==='B'&&S.flash%40<20);
+  const capE=k==='A'?6:9,capN=5,nE=Math.min(X.c.EW,capE),nN=Math.min(X.c.NS,capN);
+  for(let i=0;i<nE;i++)car(cx-56-i*25,LN,COL[(i+(k==='B'?2:0))%6],'EW');
+  for(let i=0;i<nN;i++)car(cx-10,115-i*25,COL[(i+3+(k==='B'?1:0))%6],'NS');
+  g.fillStyle=ink;g.font='600 11px system-ui';g.textAlign='center';
+  if(X.c.EW>capE)g.fillText('+'+(X.c.EW-capE),cx-56-capE*25+10,LN+22);
+  if(X.c.NS>capN)g.fillText('+'+(X.c.NS-capN),cx-10,115-capN*25+22);
+  const pass=S[pk];
+  if(pass==='EW'){const x0=cx-56,x1=k==='A'?tx(1):cx+70;car(x0+(x1-x0)*f,LN,COL[4],'EW')}
+  if(pass==='NS')car(cx-10,115+130*f,COL[5],'NS');
+  const q=S.ped[k];
+  if(!pausa&&(X.v!=='EW'||(q.y>140&&q.y<200))){q.y+=q.d*.7;if(q.y>=200){q.y=200;q.d=-1}if(q.y<=140){q.y=140;q.d=1}}
+  const moving=X.v!=='EW'||(q.y>140&&q.y<200);ped(cx-33,q.y,moving?now:0,k==='A'?'#e5484d':'#a259ff');
+  g.fillStyle=ink;g.font='700 13px system-ui';g.fillText('Agente '+k,cx,14);
+ });
+ S.cam.forEach((c,i)=>{if(c&&i<VIAJE-1){const x=Math.min(tx(i-f),XB-56-25*Math.min(S.B.c.EW,9));car(x,LN,COL[(i+1)%6],'EW')}});
+ if(S.falla){S.flash++;g.fillStyle=css('--amb');g.font='700 12px system-ui';g.textAlign='center';g.fillText('⚠ FALLO · modo fijo',XB,30)}
+ else if(com()&&S.av.length){g.strokeStyle=css('--acc');g.lineWidth=2;g.setLineDash([5,5]);g.beginPath();g.moveTo(XA+12,24);g.quadraticCurveTo((XA+XB)/2,-14,XB-12,24);g.stroke();g.setLineDash([]);
+  g.fillStyle=css('--acc');g.font='700 12px system-ui';g.textAlign='center';g.fillText('✉ A avisa a B: llegan '+S.av.length+' auto'+(S.av.length>1?'s':''),(XA+XB)/2,14)}
+}
+function ui(){
+ const n=Math.max(S.n,1);
+ $('m1').textContent=(S.esp/n).toFixed(1);$('m2').textContent=Math.round(100*S.rojo/Math.max(S.ll,1))+'%';
+ $('m3').textContent=(S.nsB/n).toFixed(1);$('m4').textContent=S.n;$('tv').textContent=tope();
+ $('bf').textContent=S.falla?'Reparar a B':'Hacer fallar a B';
+ $('estado').textContent=S.falla?'B falló: ignora los mensajes y cambia con un temporizador fijo. A sigue decidiendo por su cuenta.':(com()?'Comunicación activa: A avisa a B de los autos que le manda.':'Sin comunicación: cada agente solo ve su propio cruce.');
+}
+function loop(){if(!pausa)paso();S.last=performance.now();S.delay=620-$('vel').value*55;ui();setTimeout(loop,S.delay)}
+function frame(){draw();requestAnimationFrame(frame)}
+$('bp').onclick=()=>{pausa=!pausa;$('bp').textContent=pausa?'Reanudar':'Pausa'};
+$('bf').onclick=()=>{S.falla=!S.falla;S.tB=0};
+$('br').onclick=()=>nuevo();
+$('com').onchange=()=>{S.av=[]};
+nuevo();loop();frame();
+</script></body></html>
